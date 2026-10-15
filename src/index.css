@@ -1,0 +1,91 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --color-panel: var(--panel);
+  --color-card: var(--card);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-mute: var(--mute);
+  --color-faint: var(--faint);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-accent: var(--accent);
+  --color-switch: var(--switch);
+  --color-on-accent: var(--on-accent);
+  --shadow-panel: 0 22px 60px -10px rgba(0, 0, 0, 0.38), 0 0 0 0.5px rgba(0, 0, 0, 0.28), inset 0 0 0 0.5px rgba(255, 255, 255, 0.5);
+  --shadow-card: 0 0.5px 1px rgba(0, 0, 0, 0.06), 0 0 0 0.5px var(--line);
+}
+
+:root {
+  color-scheme: light dark;
+  --panel: rgba(247, 246, 243, 0.97);
+  --card: rgba(255, 255, 255, 0.92);
+  --line: rgba(43, 45, 51, 0.1);
+  --ink: #2b2d33;
+  --mute: rgba(43, 45, 51, 0.58);
+  --faint: rgba(43, 45, 51, 0.07);
+  --ok: #5b8c7a;
+  --warn: #b0814f;
+  --bad: #b5676f;
+  --accent: #6479a3;
+  --on-accent: #ffffff;
+  --switch: #86b5a0;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --panel: rgba(28, 29, 34, 0.97);
+    --card: rgba(255, 255, 255, 0.05);
+    --line: rgba(255, 255, 255, 0.09);
+    --ink: #ecebe8;
+    --mute: rgba(236, 235, 232, 0.58);
+    --faint: rgba(255, 255, 255, 0.09);
+    --ok: #a3cdbb;
+    --warn: #e6c898;
+    --bad: #e5a8ae;
+    --accent: #aebde0;
+    --on-accent: #1c1d22;
+    --switch: #8fc2ac;
+  }
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--ink);
+  font-size: 13px;
+  letter-spacing: -0.003em;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+button {
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
