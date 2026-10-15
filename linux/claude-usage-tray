@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+"""Claude Usage Tray para Omarchy / Waybar.
+
+Port nativo de windows-claude-usage-tray: muestra el uso real (ventana de 5 h y
+semanal) de hasta dos cuentas Claude Pro/Max en la barra superior, con un popup
+GTK4 tematizado con los colores de Omarchy.
+
+La app NO toca credenciales: el inicio de sesion lo hace el CLI oficial
+`claude auth login` dentro de un CLAUDE_CONFIG_DIR aislado por cuenta, y el uso
+sale de lo que Claude Code reporta (statusLine) o de una consulta minima opcional.
+
+Subcomandos:
+  daemon            proceso para Waybar (imprime una linea JSON por cambio)
+  popup             abre/cierra el panel
+  connect N         vincula la cuenta N (abre el login oficial)
+  disconnect N      cierra sesion de la cuenta N
+  probe N           consulta directa ahora (consume una peticion minima)
+  refresh           pide al daemon que re-verifique todo
+  statusline N      helper que invoca Claude Code (no usar a mano)
+  run N [args...]   ejecuta `claude` con el perfil de la cuenta N
+  status            imprime el estado actual (depuracion)
+"""
+
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+APP = "claude-usage-tray"
+SLOTS = (1, 2)
+LABELS = {1: "Personal", 2: "Trabajo"}
+NEAR_LIMIT = 80.0
+ALERT_LEVELS = (80, 95, 100)
+AUTH_RECHECK_SECS = 600
+TICK_SECS = 15
+SELF = Path(os.path.realpath(__file__))
+
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / APP
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+PIDFILE = RUNTIME / f"{APP}.pid"
+POPUP_PIDFILE = RUNTIME / f"{APP}-popup.pid"
+THEME_COLORS = Path.home() / ".config/omarchy/current/theme/colors.toml"
+
+SCRUBBED_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+)
+
+DEFAULT_SETTINGS = {
+    "notifications": True,
+    # Consulta directa automatica: una peticion minima (haiku, 1 turno) cuando
+    # Claude Code no ha reportado datos recientes. Consume una pizca de cuota.
+    "probe_enabled": True,
+    "probe_interval_mins": 5,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Rutas y E/S                                                                  #
+# --------------------------------------------------------------------------- #
+
+def account_dir(slot):
+    return DATA / "accounts" / str(slot)
+
+
+def config_dir(slot):
+    return account_dir(slot) / "claude"
+
+
+def apath(slot, name):
+    return account_dir(slot) / name
+
+
+def now_secs():
+    return int(time.time())
+
+
+def write_atomic(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj))
+    os.replace(tmp, path)
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def load_settings():
+    s = dict(DEFAULT_SETTINGS)
+    s.update({k: v for k, v in (read_json(DATA / "settings.json", {}) or {}).items() if k in s})
+    s["probe_interval_mins"] = max(1, min(1440, int(s["probe_interval_mins"] or 5)))
+    return s
+
+
+def save_settings(s):
+    write_atomic(DATA / "settings.json", s)
+
+
+def find_claude():
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        p = Path(d) / "claude"
+        if d and p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    p = Path.home() / ".local/bin/claude"
+    return str(p) if p.is_file() else None
+
+
+def claude_env(slot):
+    env = {k: v for k, v in os.environ.items() if k not in SCRUBBED_ENV}
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir(slot))
+    return env
+
+
+def signal_daemon():
+    """Avisa a todos los daemons (uno por cada barra/monitor)."""
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) == os.getpid():
+            continue
+        try:
+            argv = (d / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if any(a.endswith(APP.encode()) for a in argv) and b"daemon" in argv:
+            try:
+                os.kill(int(d.name), signal.SIGUSR1)
+            except OSError:
+                pass
+
+
+def pid_alive(pid, needle=APP):
+    try:
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="ignore")
+    except OSError:
+        return False
+    return needle in cmd
+
+
+# --------------------------------------------------------------------------- #
+# Modelo: snapshots, estado, formato                                           #
+# --------------------------------------------------------------------------- #
+
+def parse_window(v, key, resets_key, scale=1.0):
+    try:
+        used = float(v[key]) * scale
+        resets = int(v[resets_key])
+    except (TypeError, KeyError, ValueError):
+        return None
+    if used != used or resets <= 0:
+        return None
+    return {"used_pct": max(0.0, min(100.0, used)), "resets_at": resets}
+
+
+def parse_statusline(text, now):
+    try:
+        limits = json.loads(text)["rate_limits"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(limits, dict):
+        return None
+    snap = {
+        "captured_at": now,
+        "source": "statusline",
+        "five_hour": parse_window(limits.get("five_hour"), "used_percentage", "resets_at"),
+        "seven_day": parse_window(limits.get("seven_day"), "used_percentage", "resets_at"),
+    }
+    return snap if snap["five_hour"] or snap["seven_day"] else None
+
+
+def parse_probe(stdout, now):
+    best = None
+    for line in stdout.splitlines():
+        if "rate_limit_event" not in line:
+            continue
+        try:
+            w = json.loads(line)["rate_limit_info"]["unifiedWindows"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        snap = {
+            "captured_at": now,
+            "source": "probe",
+            # `utilization` es una fraccion 0-1 (verificado en docs/RESEARCH.md del original)
+            "five_hour": parse_window(w.get("five_hour"), "utilization", "resetsAt", 100.0),
+            "seven_day": parse_window(w.get("seven_day"), "utilization", "resetsAt", 100.0),
+        }
+        if snap["five_hour"] or snap["seven_day"]:
+            best = snap
+    return best
+
+
+def live(snap, now):
+    """Descarta ventanas ya reiniciadas: sus numeros ya no son actuales."""
+    if not snap:
+        return None
+    out = dict(snap)
+    for k in ("five_hour", "seven_day"):
+        w = snap.get(k)
+        out[k] = w if w and w["resets_at"] > now else None
+    return out if (out["five_hour"] or out["seven_day"]) else None
+
+
+def newest_usage(slot, now):
+    a = read_json(apath(slot, "usage.json"))
+    b = read_json(apath(slot, "probe.json"))
+    cands = [s for s in (live(a, now), live(b, now)) if s]
+    return max(cands, key=lambda s: s["captured_at"]) if cands else None
+
+
+def compute_status(connection, usage):
+    if connection != "connected":
+        return "disconnected"
+    w = (usage or {}).get("five_hour")
+    if not w:
+        return "no_data"
+    if w["used_pct"] >= 100:
+        return "exhausted"
+    if w["used_pct"] >= NEAR_LIMIT:
+        return "near_limit"
+    return "available"
+
+
+def build_views(now=None):
+    now = now or now_secs()
+    views = []
+    for slot in SLOTS:
+        ident = read_json(apath(slot, "identity.json"), {}) or {}
+        conn = ident.get("connection", "disconnected")
+        connecting = (read_json(apath(slot, "connecting"), 0) or 0) > now
+        if connecting and conn != "connected":
+            conn = "connecting"
+        usage = newest_usage(slot, now) if conn == "connected" else None
+        views.append({
+            "slot": slot,
+            "label": LABELS[slot],
+            "connection": conn,
+            "email": ident.get("email"),
+            "plan": ident.get("plan"),
+            "error": ident.get("error"),
+            "usage": usage,
+            "status": compute_status(conn, usage),
+            "busy": (read_json(apath(slot, "busy"), 0) or 0) > now,
+        })
+    return views
+
+
+def fmt_remaining(secs):
+    s = max(0, int(secs))
+    d, h, m, sec = s // 86400, s % 86400 // 3600, s % 3600 // 60, s % 60
+    if d:
+        return f"{d} d {h} h"
+    if h:
+        return f"{h} h {m} min"
+    if m:
+        return f"{m} min {sec} s"
+    return f"{sec} s"
+
+
+def fmt_short(secs):
+    s = max(0, int(secs))
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m" if m else "<1m"
+
+
+def fmt_clock(epoch, now):
+    t = time.localtime(epoch)
+    clock = time.strftime("%H:%M", t)
+    if time.strftime("%Y%j", t) == time.strftime("%Y%j", time.localtime(now)):
+        return clock
+    days = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+    return f"{days[t.tm_wday]} {clock}"
+
+
+def fmt_ago(epoch, now):
+    d = max(0, now - epoch)
+    if d < 5:
+        return "ahora"
+    if d < 60:
+        return f"hace {d} s"
+    if d < 3600:
+        return f"hace {max(1, round(d / 60))} min"
+    if d < 86400:
+        return f"hace {round(d / 3600)} h"
+    return f"hace {round(d / 86400)} d"
+
+
+def fmt_plan(plan):
+    if not plan:
+        return None
+    known = {"pro": "Pro", "max": "Max", "team": "Team", "enterprise": "Enterprise", "free": "Free"}
+    return known.get(plan.lower(), plan.capitalize())
+
+
+def pct(n):
+    return f"{round(n)}%"
+
+
+# --------------------------------------------------------------------------- #
+# Tema de Omarchy                                                              #
+# --------------------------------------------------------------------------- #
+
+def theme_colors():
+    base = {
+        "background": "#282828", "foreground": "#d4be98", "accent": "#7daea3",
+        "color1": "#ea6962", "color2": "#a9b665", "color3": "#d8a657",
+    }
+    try:
+        import tomllib
+        base.update({k: v for k, v in tomllib.loads(THEME_COLORS.read_text()).items() if isinstance(v, str)})
+    except (OSError, ValueError, ImportError):
+        pass
+    return base
+
+
+# --------------------------------------------------------------------------- #
+# Claude CLI                                                                   #
+# --------------------------------------------------------------------------- #
+
+def ensure_statusline(slot):
+    """Hace que el perfil de esta cuenta reporte sus limites a nuestro helper."""
+    cdir = config_dir(slot)
+    cdir.mkdir(parents=True, exist_ok=True)
+    path = cdir / "settings.json"
+    root = read_json(path, {})
+    if not isinstance(root, dict):
+        root = {}
+    desired = {
+        "type": "command",
+        "command": f"{shlex.quote(str(SELF))} statusline {slot}",
+        "refreshInterval": 5,
+    }
+    if root.get("statusLine") == desired:
+        return
+    root["statusLine"] = desired
+    path.write_text(json.dumps(root, indent=2))
+
+
+def parse_auth_status(stdout):
+    i = stdout.find("{")
+    if i < 0:
+        raise ValueError("respuesta vacía de claude auth status")
+    return json.loads(stdout[i:])
+
+
+def check_auth(slot):
+    """Pregunta al `claude` oficial quien esta conectado y lo guarda en identity.json."""
+    prev = read_json(apath(slot, "identity.json"), {}) or {}
+    claude = find_claude()
+    if not claude:
+        write_atomic(apath(slot, "identity.json"), {**prev, "connection": "error",
+                                                    "error": "Claude Code no está instalado", "checked_at": now_secs()})
+        return
+    config_dir(slot).mkdir(parents=True, exist_ok=True)
+    try:
+        out = subprocess.run([claude, "auth", "status"], env=claude_env(slot), stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=25).stdout
+        st = parse_auth_status(out)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        # No tumbamos una sesion buena por un fallo puntual
+        conn = prev.get("connection", "error")
+        write_atomic(apath(slot, "identity.json"), {**prev, "connection": conn if conn == "connected" else "error",
+                                                    "error": f"No se pudo verificar la sesión: {e}",
+                                                    "checked_at": now_secs()})
+        return
+    if st.get("loggedIn"):
+        if st.get("authMethod") != "claude.ai":
+            ident = {"connection": "error", "error": "Solo cuentas Claude Pro/Max (claude.ai)"}
+        else:
+            ident = {"connection": "connected", "email": st.get("email"),
+                     "plan": st.get("subscriptionType"), "error": None}
+            ensure_statusline(slot)
+    else:
+        was = prev.get("connection") in ("connected", "expired")
+        ident = {"connection": "expired" if was else "disconnected", "email": prev.get("email") if was else None,
+                 "plan": prev.get("plan") if was else None,
+                 "error": "La sesión expiró." if was else None}
+    ident["checked_at"] = now_secs()
+    write_atomic(apath(slot, "identity.json"), ident)
+    if ident["connection"] == "connected":
+        apath(slot, "connecting").unlink(missing_ok=True)
+
+
+def probe(slot):
+    """Una peticion minima real a traves del binario oficial; lee rate_limit_event."""
+    claude = find_claude()
+    if not claude:
+        raise RuntimeError("Claude Code no está instalado")
+    work = account_dir(slot) / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    write_atomic(apath(slot, "busy"), now_secs() + 100)
+    try:
+        out = subprocess.run(
+            [claude, "-p", ".", "--model", "haiku", "--output-format", "stream-json", "--verbose",
+             "--max-turns", "1", "--no-session-persistence"],
+            env=claude_env(slot), cwd=work, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"claude no respondió: {e}")
+    finally:
+        apath(slot, "busy").unlink(missing_ok=True)
+    snap = parse_probe(out, now_secs())
+    if not snap:
+        raise RuntimeError("claude no devolvió datos de límite (¿plan sin límites de suscripción?)")
+    write_atomic(apath(slot, "probe.json"), snap)
+    return snap
+
+
+# --------------------------------------------------------------------------- #
+# Comandos de usuario                                                          #
+# --------------------------------------------------------------------------- #
+
+def cmd_statusline(slot_arg):
+    try:
+        slot = int(slot_arg)
+    except ValueError:
+        return 0
+    if slot not in SLOTS:
+        return 0
+    env_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    if env_dir and os.path.realpath(env_dir) != os.path.realpath(config_dir(slot)):
+        return 0  # nunca escribir sobre otra cuenta
+    snap = parse_statusline(sys.stdin.read(1 << 20), now_secs())
+    if snap:
+        write_atomic(apath(slot, "usage.json"), snap)
+    return 0
+
+
+def cmd_connect(slot):
+    claude = find_claude()
+    if not claude:
+        notify("Claude Code no está instalado", "Instálalo primero (claude.ai/download).", urgency="critical")
+        return 1
+    ensure_statusline(slot)
+    write_atomic(apath(slot, "connecting"), now_secs() + 300)
+    cfg = shlex.quote(str(config_dir(slot)))
+    script = (
+        f"unset {' '.join(SCRUBBED_ENV)}; export CLAUDE_CONFIG_DIR={cfg}; "
+        f"echo 'Inicia sesión con la cuenta que quieres usar como cuenta {slot} ({LABELS[slot]}).'; echo; "
+        f"{shlex.quote(claude)} auth login --claudeai; "
+        f"{shlex.quote(str(SELF))} refresh; echo; echo 'Listo. Puedes cerrar esta ventana.'; sleep 3"
+    )
+    subprocess.Popen(
+        ["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--app-id=org.omarchy.terminal",
+         f"--title=Conectar Claude · {LABELS[slot]}", "-e", "bash", "-c", script],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    signal_daemon()
+    return 0
+
+
+def cmd_disconnect(slot):
+    claude = find_claude()
+    if claude:
+        subprocess.run([claude, "auth", "logout"], env=claude_env(slot), stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=25)
+    for name in ("usage.json", "probe.json", "identity.json", "alerts.json", "connecting", "probe_meta.json"):
+        apath(slot, name).unlink(missing_ok=True)
+    signal_daemon()
+    return 0
+
+
+def cmd_probe(slot):
+    try:
+        probe(slot)
+        write_atomic(apath(slot, "probe_meta.json"), {"last_try": now_secs(), "fails": 0})
+    except RuntimeError as e:
+        ident = read_json(apath(slot, "identity.json"), {}) or {}
+        write_atomic(apath(slot, "identity.json"), {**ident, "error": str(e)})
+        signal_daemon()
+        return 1
+    ident = read_json(apath(slot, "identity.json"), {}) or {}
+    if ident.get("error"):
+        write_atomic(apath(slot, "identity.json"), {**ident, "error": None})
+    signal_daemon()
+    return 0
+
+
+def cmd_run(slot, args):
+    claude = find_claude()
+    if not claude:
+        print("claude no encontrado", file=sys.stderr)
+        return 1
+    ensure_statusline(slot)
+    os.execve(claude, [claude, *args], claude_env(slot))
+
+
+def notify(title, body, urgency="normal"):
+    try:
+        subprocess.Popen(["notify-send", "-a", "Claude Usage", "-u", urgency, "-i", "dialog-information", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Daemon (Waybar)                                                              #
+# --------------------------------------------------------------------------- #
+
+ICON = "\U000f1719"  # nf-md-robot
+
+
+def span(color, text):
+    return f"<span foreground='{color}'>{text}</span>"
+
+
+def waybar_payload(views, now, colors):
+    warn, bad = colors["color3"], colors["color1"]
+    conn = [v for v in views if v["connection"] == "connected"]
+    if not conn:
+        connecting = any(v["connection"] == "connecting" for v in views)
+        text = ICON
+        tip = "<b>Claude Usage</b>\n" + (
+            "Completa el inicio de sesión en la ventana que se abrió…" if connecting
+            else "Sin cuentas vinculadas\n<i>Clic para vincular tu cuenta</i>")
+        return {"text": text, "tooltip": tip, "class": ["disconnected"], "alt": "disconnected"}
+
+    parts, lines = [], ["<b>Claude Usage</b>"]
+    worst = "available"
+    rank = {"available": 0, "no_data": 0, "near_limit": 1, "exhausted": 2}
+    for v in conn:
+        st = v["status"]
+        if rank.get(st, 0) > rank[worst]:
+            worst = st
+        w = (v["usage"] or {}).get("five_hour")
+        if w:
+            t = pct(w["used_pct"])
+            parts.append(span(bad, t) if st == "exhausted" else span(warn, t) if st == "near_limit" else t)
+        else:
+            parts.append("–")
+        who = v["email"] or v["label"]
+        lines.append(f"\n<b>{who}</b>  <small>{v['label']}{' · ' + fmt_plan(v['plan']) if v['plan'] else ''}</small>")
+        if w:
+            lines.append(f"  5 h      <b>{pct(w['used_pct'])}</b>  · reinicia en {fmt_short(w['resets_at'] - now)}")
+            wk = v["usage"].get("seven_day")
+            if wk:
+                lines.append(f"  Semanal  <b>{pct(wk['used_pct'])}</b>  · reinicia en {fmt_short(wk['resets_at'] - now)}")
+        else:
+            lines.append("  No disponible — usa Claude Code o consulta desde el panel")
+    for v in views:
+        if v["connection"] == "expired":
+            lines.append(f"\n<i>{v['label']}: sesión expirada</i>")
+    lines.append("\n<i>Clic: panel · Clic derecho: actualizar</i>")
+    cls = {"available": "ok", "no_data": "nodata", "near_limit": "warning", "exhausted": "critical"}[worst]
+    first = (conn[0]["usage"] or {}).get("five_hour")
+    return {
+        "text": f"{ICON} <span size='90%'>" + " ".join(parts) + "</span>",
+        "tooltip": "\n".join(lines),
+        "class": [cls],
+        "alt": worst,
+        "percentage": round(first["used_pct"]) if first else 0,
+    }
+
+
+class Daemon:
+    def __init__(self):
+        self.wake = threading.Event()
+        self.force = False
+        self.inflight = set()
+        self.lock = threading.Lock()
+        self.last_auth = {}
+        self.last_line = None
+
+    def on_usr1(self, *_):
+        self.force = True
+        self.wake.set()
+
+    # -- trabajo en segundo plano --
+    def spawn(self, key, fn):
+        with self.lock:
+            if key in self.inflight:
+                return
+            self.inflight.add(key)
+
+        def run():
+            try:
+                fn()
+            except Exception:
+                pass
+            finally:
+                with self.lock:
+                    self.inflight.discard(key)
+                self.wake.set()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def maybe_probe(self, slot, settings, now):
+        meta = read_json(apath(slot, "probe_meta.json"), {}) or {}
+        interval = settings["probe_interval_mins"] * 60
+        backoff = min(interval * (2 ** min(meta.get("fails", 0), 6)), 1800)
+        if now - meta.get("last_try", 0) < max(interval, backoff):
+            return
+        # Si Claude Code reporto algo reciente, no gastamos cuota
+        for name in ("usage.json", "probe.json"):
+            s = live(read_json(apath(slot, name)), now)
+            if s and now - s["captured_at"] < interval:
+                return
+
+        def job():
+            try:
+                probe(slot)
+                write_atomic(apath(slot, "probe_meta.json"), {"last_try": now_secs(), "fails": 0})
+            except RuntimeError:
+                m = read_json(apath(slot, "probe_meta.json"), {}) or {}
+                write_atomic(apath(slot, "probe_meta.json"),
+                             {"last_try": now_secs(), "fails": m.get("fails", 0) + 1})
+
+        self.spawn(("probe", slot), job)
+
+    def check_alerts(self, view, settings, now):
+        if not settings["notifications"]:
+            return
+        w = (view["usage"] or {}).get("five_hour")
+        if not w:
+            return
+        mem = read_json(apath(view["slot"], "alerts.json"), None)
+        same = mem and abs(mem["resets_at"] - w["resets_at"]) < 600
+        prev = mem["level"] if same else 0
+        level = max([l for l in ALERT_LEVELS if w["used_pct"] >= l], default=0)
+        write_atomic(apath(view["slot"], "alerts.json"), {"resets_at": w["resets_at"], "level": max(level, prev)})
+        if level > prev:
+            who = view["email"] or view["label"]
+            if level >= 100:
+                notify(f"Claude · {view['label']} agotado", f"{who}: límite de 5 h alcanzado. Reinicia en {fmt_short(w['resets_at'] - now)}.", "critical")
+            else:
+                notify(f"Claude · {view['label']} al {level}%", f"{who}: usaste {pct(w['used_pct'])} de tu ventana de 5 h. Reinicia en {fmt_short(w['resets_at'] - now)}.")
+
+    def emit(self, payload):
+        line = json.dumps(payload, ensure_ascii=False)
+        if line == self.last_line:
+            return
+        self.last_line = line
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            os._exit(0)  # Waybar se reinicio: este daemon sobra
+
+    def run(self):
+        signal.signal(signal.SIGUSR1, self.on_usr1)
+        signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+        colors = theme_colors()
+        while True:
+            now = now_secs()
+            settings = load_settings()
+            connecting = False
+            for slot in SLOTS:
+                is_connecting = (read_json(apath(slot, "connecting"), 0) or 0) > now
+                connecting |= is_connecting
+                ident = read_json(apath(slot, "identity.json"), {}) or {}
+                due = (self.force or now - self.last_auth.get(slot, 0) >= AUTH_RECHECK_SECS
+                       or (is_connecting and now - self.last_auth.get(slot, 0) >= 3))
+                if due:
+                    self.last_auth[slot] = now
+                    before = ident.get("connection")
+
+                    def job(s=slot, b=before):
+                        check_auth(s)
+                        after = (read_json(apath(s, "identity.json"), {}) or {}).get("connection")
+                        if after == "connected" and b != "connected":
+                            # Recien vinculada: primera lectura inmediata
+                            try:
+                                probe(s)
+                            except RuntimeError:
+                                pass
+
+                    self.spawn(("auth", slot), job)
+                elif ident.get("connection") == "connected" and settings["probe_enabled"]:
+                    self.maybe_probe(slot, settings, now)
+            self.force = False
+
+            views = build_views(now)
+            for v in views:
+                if v["connection"] == "connected":
+                    self.check_alerts(v, settings, now)
+            self.emit(waybar_payload(views, now, colors))
+            self.wake.wait(3 if connecting else TICK_SECS)
+            self.wake.clear()
+
+
+# --------------------------------------------------------------------------- #
+# Popup GTK4 + layer-shell                                                     #
+# --------------------------------------------------------------------------- #
+
+def popup_css(c):
+    bg, fg, ac = c["background"], c["foreground"], c["accent"]
+    ok, warn, bad = c["color2"], c["color3"], c["color1"]
+    return f"""
+* {{ font-family: 'JetBrainsMono Nerd Font', monospace; font-size: 12px; }}
+window.backdrop-win {{ background: transparent; }}
+.panel {{ background: {bg}; color: {fg}; border: 2px solid {ac}; padding: 12px; opacity: 0; transition: opacity 140ms ease-out; }}
+.panel.shown {{ opacity: 1; }}
+.title {{ font-weight: 800; font-size: 13px; letter-spacing: 1px; }}
+.mute {{ color: alpha({fg}, 0.58); }}
+.tiny {{ font-size: 10px; }}
+.caps {{ font-size: 10px; font-weight: 700; letter-spacing: 1.2px; color: alpha({fg}, 0.58); }}
+.card {{ background: alpha({fg}, 0.05); border: 1px solid alpha({fg}, 0.12); padding: 12px; }}
+.avatar {{ background: {ac}; color: {bg}; font-weight: 800; font-size: 15px; min-width: 34px; min-height: 34px; }}
+.avatar.off {{ background: alpha({fg}, 0.12); color: alpha({fg}, 0.58); }}
+.name {{ font-weight: 700; font-size: 13px; }}
+.chip {{ padding: 1px 8px; font-size: 10px; font-weight: 700; background: alpha({fg}, 0.1); color: alpha({fg}, 0.7); }}
+.chip.available {{ background: alpha({ok}, 0.16); color: {ok}; }}
+.chip.near_limit {{ background: alpha({warn}, 0.18); color: {warn}; }}
+.chip.exhausted {{ background: alpha({bad}, 0.18); color: {bad}; }}
+.big {{ font-size: 30px; font-weight: 800; }}
+.big.warn {{ color: {warn}; }}
+.big.bad {{ color: {bad}; }}
+progressbar > trough {{ min-height: 8px; background: alpha({fg}, 0.12); border: none; border-radius: 0; }}
+progressbar > trough > progress {{ min-height: 8px; min-width: 0; margin: 0; background: {ok}; border: none; border-radius: 0; }}
+progressbar.warn > trough > progress {{ background: {warn}; }}
+progressbar.bad > trough > progress {{ background: {bad}; }}
+progressbar.thin > trough, progressbar.thin > trough > progress {{ min-height: 4px; }}
+.sep {{ background: alpha({fg}, 0.12); min-height: 1px; }}
+.notice {{ background: alpha({warn}, 0.14); color: {warn}; padding: 8px 10px; }}
+.hint {{ background: alpha({fg}, 0.06); padding: 10px; }}
+button {{ background: alpha({fg}, 0.08); color: {fg}; border: 1px solid alpha({fg}, 0.14); border-radius: 0;
+         padding: 4px 10px; box-shadow: none; text-shadow: none; min-height: 0; min-width: 0; }}
+button:hover {{ background: alpha({fg}, 0.16); }}
+button.primary {{ background: {ac}; color: {bg}; border-color: {ac}; font-weight: 700; }}
+button.primary:hover {{ background: alpha({ac}, 0.85); }}
+button.flat {{ background: transparent; border-color: transparent; padding: 2px 6px; }}
+button.flat:hover {{ background: alpha({fg}, 0.12); }}
+button.danger {{ color: {bad}; }}
+button:disabled {{ opacity: 0.5; }}
+switch {{ background: alpha({fg}, 0.18); border-radius: 0; border: none; min-height: 18px; min-width: 34px; }}
+switch:checked {{ background: {ac}; }}
+switch slider {{ background: {fg}; border-radius: 0; min-height: 14px; min-width: 14px; margin: 2px; border: none; }}
+switch:checked slider {{ background: {bg}; }}
+"""
+
+
+class Card:
+    def __init__(self, slot, popup):
+        from gi.repository import Gtk
+        self.Gtk = Gtk
+        self.slot = slot
+        self.popup = popup
+        self.view = None
+        self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.root.add_css_class("card")
+
+        # Cabecera
+        head = Gtk.Box(spacing=10)
+        self.avatar = Gtk.Label(label="?")
+        self.avatar.add_css_class("avatar")
+        self.avatar.set_valign(Gtk.Align.CENTER)
+        head.append(self.avatar)
+        names = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        names.set_hexpand(True)
+        names.set_valign(Gtk.Align.CENTER)
+        self.name = Gtk.Label(xalign=0)
+        self.name.add_css_class("name")
+        self.name.set_ellipsize(3)
+        self.name.set_max_width_chars(26)
+        self.sub = Gtk.Label(xalign=0)
+        self.sub.add_css_class("mute")
+        self.sub.add_css_class("tiny")
+        names.append(self.name)
+        names.append(self.sub)
+        head.append(names)
+        self.chip = Gtk.Label()
+        self.chip.add_css_class("chip")
+        self.chip.set_valign(Gtk.Align.CENTER)
+        head.append(self.chip)
+        self.menu_btn = Gtk.Button(label="")
+        self.menu_btn.add_css_class("flat")
+        self.menu_btn.connect("clicked", lambda *_: self.menu.set_reveal_child(not self.menu.get_reveal_child()))
+        head.append(self.menu_btn)
+        self.root.append(head)
+
+        # Menu de cuenta
+        self.menu = Gtk.Revealer()
+        mbox = Gtk.Box(spacing=6)
+        b1 = Gtk.Button(label="  Volver a autenticar")
+        b1.connect("clicked", lambda *_: popup.run_cmd("connect", slot))
+        b2 = Gtk.Button(label="  Desconectar")
+        b2.add_css_class("danger")
+        b2.connect("clicked", lambda *_: popup.run_cmd("disconnect", slot))
+        mbox.append(b1)
+        mbox.append(b2)
+        self.menu.set_child(mbox)
+        self.root.append(self.menu)
+
+        # Cuerpo
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_vhomogeneous(False)
+        self.stack.add_named(self._page_connect(), "connect")
+        self.stack.add_named(self._page_wait(), "wait")
+        self.stack.add_named(self._page_nodata(), "nodata")
+        self.stack.add_named(self._page_data(), "data")
+        self.root.append(self.stack)
+
+    # --- páginas ---
+    def _page_connect(self):
+        Gtk = self.Gtk
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.err = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
+        self.err.add_css_class("notice")
+        box.append(self.err)
+        self.connect_btn = Gtk.Button()
+        self.connect_btn.add_css_class("primary")
+        self.connect_btn.connect("clicked", lambda *_: self.popup.run_cmd("connect", self.slot))
+        box.append(self.connect_btn)
+        self.connect_hint = Gtk.Label(xalign=0, wrap=True, max_width_chars=48)
+        self.connect_hint.add_css_class("mute")
+        self.connect_hint.add_css_class("tiny")
+        box.append(self.connect_hint)
+        return box
+
+    def _page_wait(self):
+        Gtk = self.Gtk
+        box = Gtk.Box(spacing=10)
+        box.add_css_class("hint")
+        sp = Gtk.Spinner()
+        sp.start()
+        box.append(sp)
+        lbl = Gtk.Label(label="Completa el inicio de sesión en la ventana que se abrió…", xalign=0, wrap=True, max_width_chars=36)
+        lbl.add_css_class("mute")
+        box.append(lbl)
+        return box
+
+    def _page_nodata(self):
+        Gtk = self.Gtk
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.add_css_class("hint")
+        t = Gtk.Label(label="  No disponible", xalign=0)
+        t.add_css_class("name")
+        box.append(t)
+        d = Gtk.Label(
+            label="Claude solo informa el uso mientras se usa Claude Code con esta cuenta. "
+                  "Úsalo una vez o consulta ahora (consume una petición mínima).",
+            xalign=0, wrap=True, max_width_chars=44)
+        d.add_css_class("mute")
+        box.append(d)
+        self.nodata_btn = Gtk.Button()
+        self.nodata_btn.set_halign(Gtk.Align.START)
+        self.nodata_btn.connect("clicked", lambda *_: self.popup.run_cmd("probe", self.slot))
+        box.append(self.nodata_btn)
+        return box
+
+    def _page_data(self):
+        Gtk = self.Gtk
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        cap = Gtk.Label(label="VENTANA DE 5 HORAS", xalign=0)
+        cap.add_css_class("caps")
+        box.append(cap)
+        row = Gtk.Box()
+        self.big = Gtk.Label(xalign=0)
+        self.big.add_css_class("big")
+        self.big.set_hexpand(True)
+        row.append(self.big)
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        right.set_valign(Gtk.Align.END)
+        self.left_lbl = Gtk.Label(xalign=1)
+        self.left_lbl.add_css_class("mute")
+        self.reset_lbl = Gtk.Label(xalign=1)
+        right.append(self.left_lbl)
+        right.append(self.reset_lbl)
+        row.append(right)
+        box.append(row)
+        self.bar = Gtk.ProgressBar()
+        box.append(self.bar)
+        self.clock_lbl = Gtk.Label(xalign=0)
+        self.clock_lbl.add_css_class("mute")
+        self.clock_lbl.add_css_class("tiny")
+        box.append(self.clock_lbl)
+
+        self.week_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        sep = Gtk.Box()
+        sep.add_css_class("sep")
+        self.week_box.append(sep)
+        wrow = Gtk.Box()
+        wl = Gtk.Label(label="Semanal", xalign=0)
+        wl.add_css_class("mute")
+        wl.set_hexpand(True)
+        self.week_lbl = Gtk.Label(xalign=1)
+        wrow.append(wl)
+        wrow.append(self.week_lbl)
+        self.week_box.append(wrow)
+        self.week_bar = Gtk.ProgressBar()
+        self.week_bar.add_css_class("thin")
+        self.week_box.append(self.week_bar)
+        box.append(self.week_box)
+
+        foot = Gtk.Box()
+        self.age_lbl = Gtk.Label(xalign=0)
+        self.age_lbl.add_css_class("mute")
+        self.age_lbl.add_css_class("tiny")
+        self.age_lbl.set_hexpand(True)
+        foot.append(self.age_lbl)
+        self.refresh_btn = Gtk.Button()
+        self.refresh_btn.add_css_class("flat")
+        self.refresh_btn.connect("clicked", lambda *_: self.popup.run_cmd("probe", self.slot))
+        foot.append(self.refresh_btn)
+        box.append(foot)
+        return box
+
+    # --- actualización ---
+    @staticmethod
+    def _tone(p):
+        return "bad" if p >= 100 else "warn" if p >= NEAR_LIMIT else ""
+
+    def _set_tone(self, widget, tone):
+        for t in ("warn", "bad"):
+            widget.remove_css_class(t)
+        if tone:
+            widget.add_css_class(tone)
+
+    def update(self, v, now):
+        self.view = v
+        conn = v["connection"]
+        connected = conn == "connected"
+        email = v["email"]
+        self.avatar.set_label(email[0].upper() if email else "")
+        (self.avatar.remove_css_class if email else self.avatar.add_css_class)("off")
+        self.name.set_label(email if email else f"Cuenta {v['slot']} · {v['label']}")
+        plan = fmt_plan(v["plan"])
+        self.sub.set_label(v["label"] + (f" · {plan}" if plan and connected else ""))
+        self.menu_btn.set_visible(connected or conn == "expired")
+        if not (connected or conn == "expired"):
+            self.menu.set_reveal_child(False)
+
+        chip_map = {"available": "Disponible", "near_limit": "Cerca del límite", "exhausted": "Agotado",
+                    "no_data": "Sin datos", "disconnected": "Desconectada"}
+        text = ("Sesión expirada" if conn == "expired" else "Conectando…" if conn == "connecting"
+                else chip_map[v["status"]])
+        self.chip.set_label(text)
+        for c in chip_map:
+            self.chip.remove_css_class(c)
+        if conn in ("connected",):
+            self.chip.add_css_class(v["status"])
+
+        if conn == "connecting":
+            self.stack.set_visible_child_name("wait")
+            return
+        if not connected:
+            expired = conn == "expired"
+            self.err.set_visible(bool(expired or v["error"]))
+            self.err.set_label(v["error"] or "La sesión expiró.")
+            self.connect_btn.set_label(("  Reconectar Claude" if expired else "  Vincular mi cuenta de Claude"))
+            self.connect_btn.set_sensitive(find_claude() is not None)
+            self.connect_hint.set_label(
+                "El inicio de sesión lo hace Claude Code (navegador), no esta app." if find_claude()
+                else "Requiere Claude Code instalado. El inicio de sesión lo hace Claude Code, no esta app.")
+            self.stack.set_visible_child_name("connect")
+            return
+
+        u = v["usage"] or {}
+        five, week = u.get("five_hour"), u.get("seven_day")
+        busy = v["busy"]
+        lbl = "  Consultando…" if busy else "  Consultar ahora"
+        if not five:
+            self.nodata_btn.set_label(lbl)
+            self.nodata_btn.set_sensitive(not busy)
+            self.stack.set_visible_child_name("nodata")
+            return
+        tone = self._tone(five["used_pct"])
+        self.big.set_label(pct(five["used_pct"]))
+        self._set_tone(self.big, tone)
+        self.left_lbl.set_label(f"{pct(max(0, 100 - five['used_pct']))} restante")
+        self.reset_lbl.set_label(f"Reinicia en {fmt_remaining(five['resets_at'] - now)}")
+        self.bar.set_fraction(five["used_pct"] / 100)
+        self._set_tone(self.bar, tone)
+        self.clock_lbl.set_label(f"Se reinicia a las {fmt_clock(five['resets_at'], now)}")
+        self.week_box.set_visible(bool(week))
+        if week:
+            self.week_lbl.set_label(f"{pct(week['used_pct'])} · reinicia en {fmt_remaining(week['resets_at'] - now)}")
+            self.week_bar.set_fraction(week["used_pct"] / 100)
+            self._set_tone(self.week_bar, self._tone(week["used_pct"]))
+        src = "consulta directa" if u.get("source") == "probe" else "Claude Code"
+        self.age_lbl.set_label(f"Dato de {fmt_ago(u['captured_at'], now)} · {src}")
+        self.refresh_btn.set_label("" if busy else "")
+        self.refresh_btn.set_tooltip_text("Consultar ahora (consume una petición mínima)")
+        self.refresh_btn.set_sensitive(not busy)
+        self.stack.set_visible_child_name("data")
+
+
+class Popup:
+    def __init__(self):
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Gtk4LayerShell", "1.0")
+        from gi.repository import Gdk, GLib, Gtk
+        from gi.repository import Gtk4LayerShell as LS
+        self.Gtk, self.GLib, self.Gdk, self.LS = Gtk, GLib, Gdk, LS
+        self.cards = {}
+        self.last_sig = None
+
+    def run_cmd(self, cmd, slot):
+        subprocess.Popen([str(SELF), cmd, str(slot)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        # Feedback inmediato en la tarjeta mientras el comando arranca
+        if cmd == "probe":
+            write_atomic(apath(slot, "busy"), now_secs() + 100)
+        if cmd == "connect":
+            # Cerrar el panel: es una capa overlay a pantalla completa con teclado
+            # exclusivo y taparia la terminal del login.
+            write_atomic(apath(slot, "connecting"), now_secs() + 300)
+            self.app.quit()
+            return
+        self.GLib.timeout_add(250, self.tick)
+
+    def build(self, app):
+        self.app = app
+        Gtk, LS = self.Gtk, self.LS
+        css = Gtk.CssProvider()
+        css.load_from_string(popup_css(theme_colors()))
+        Gtk.StyleContext.add_provider_for_display(self.Gdk.Display.get_default(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        win = Gtk.ApplicationWindow(application=app)
+        win.add_css_class("backdrop-win")
+        LS.init_for_window(win)
+        LS.set_namespace(win, APP)
+        LS.set_layer(win, LS.Layer.OVERLAY)
+        LS.set_keyboard_mode(win, LS.KeyboardMode.EXCLUSIVE)
+        for edge in (LS.Edge.TOP, LS.Edge.BOTTOM, LS.Edge.LEFT, LS.Edge.RIGHT):
+            LS.set_anchor(win, edge, True)
+
+        backdrop = Gtk.Box()
+        backdrop.set_hexpand(True)
+        backdrop.set_vexpand(True)
+        click = Gtk.GestureClick()
+        click.connect("pressed", self.on_backdrop)
+        backdrop.add_controller(click)
+
+        self.panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.panel.add_css_class("panel")
+        self.panel.set_size_request(360, -1)
+        self.panel.set_hexpand(True)
+        self.panel.set_vexpand(True)
+        self.panel.set_halign(Gtk.Align.END)
+        self.panel.set_valign(Gtk.Align.START)
+        self.panel.set_margin_top(4)
+        self.panel.set_margin_end(4)
+
+        head = Gtk.Box(spacing=8)
+        t = Gtk.Label(label=f"  CLAUDE USAGE", xalign=0)
+        t.add_css_class("title")
+        t.set_hexpand(True)
+        head.append(t)
+        rb = Gtk.Button(label="")
+        rb.add_css_class("flat")
+        rb.set_tooltip_text("Re-verificar sesiones")
+        rb.connect("clicked", lambda *_: (signal_daemon(), self.GLib.timeout_add(600, self.tick)))
+        head.append(rb)
+        self.panel.append(head)
+
+        for slot in SLOTS:
+            self.cards[slot] = Card(slot, self)
+            self.panel.append(self.cards[slot].root)
+
+        foot = Gtk.Box(spacing=8)
+        fl = Gtk.Label(label="Consulta directa automática", xalign=0)
+        fl.add_css_class("mute")
+        fl.add_css_class("tiny")
+        fl.set_hexpand(True)
+        fl.set_tooltip_text("Hace una petición mínima cada pocos minutos si Claude Code no reportó datos.\n"
+                            "Desactívala si prefieres no gastar nada de cuota.")
+        foot.append(fl)
+        self.sw = Gtk.Switch()
+        self.sw.set_active(load_settings()["probe_enabled"])
+        self.sw.connect("notify::active", self.on_switch)
+        foot.append(self.sw)
+        self.panel.append(foot)
+
+        backdrop.append(self.panel)  # el backdrop es un Box horizontal; el panel usa halign/valign
+        win.set_child(backdrop)
+        key = Gtk.EventControllerKey()
+        key.connect("key-pressed", lambda c, kv, *_: app.quit() if kv == self.Gdk.KEY_Escape else None)
+        win.add_controller(key)
+        win.present()
+        self.tick()
+        self.GLib.timeout_add_seconds(1, self.tick)
+        self.GLib.timeout_add(30, lambda: self.panel.add_css_class("shown") and False)
+
+    def on_backdrop(self, gesture, _n, x, y):
+        # Solo cerrar si el clic cae fuera del panel (sin reclamar el evento,
+        # para no cancelar los clics de los botones).
+        ok, b = self.panel.compute_bounds(gesture.get_widget())
+        if ok and b.get_x() <= x <= b.get_x() + b.get_width() and b.get_y() <= y <= b.get_y() + b.get_height():
+            return
+        self.app.quit()
+
+    def on_switch(self, sw, _):
+        s = load_settings()
+        s["probe_enabled"] = sw.get_active()
+        save_settings(s)
+        signal_daemon()
+
+    def tick(self):
+        now = now_secs()
+        for v in build_views(now):
+            self.cards[v["slot"]].update(v, now)
+        return True
+
+
+def cmd_popup():
+    # gtk4-layer-shell debe cargarse antes que libwayland en Python
+    lib = "/usr/lib/libgtk4-layer-shell.so"
+    if lib not in os.environ.get("LD_PRELOAD", "") and os.path.exists(lib):
+        env = dict(os.environ)
+        env["LD_PRELOAD"] = (lib + " " + env.get("LD_PRELOAD", "")).strip()
+        os.execve(sys.executable, [sys.executable, str(SELF), "popup"], env)
+
+    # Toggle: si ya hay un popup abierto, cerrarlo
+    try:
+        old = int(POPUP_PIDFILE.read_text())
+        if old != os.getpid() and pid_alive(old):
+            os.kill(old, signal.SIGTERM)
+            return 0
+    except (OSError, ValueError):
+        pass
+    POPUP_PIDFILE.write_text(str(os.getpid()))
+
+    import gi
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gtk
+    popup = Popup()
+    app = Gtk.Application(application_id=None)
+    app.connect("activate", popup.build)
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    try:
+        return app.run([])
+    finally:
+        POPUP_PIDFILE.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# main                                                                         #
+# --------------------------------------------------------------------------- #
+
+def slot_arg(argv, i=2):
+    try:
+        s = int(argv[i])
+    except (IndexError, ValueError):
+        sys.exit(f"uso: {APP} {argv[1]} <1|2>")
+    if s not in SLOTS:
+        sys.exit("la cuenta debe ser 1 o 2")
+    return s
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "popup"
+    if cmd == "statusline":
+        return cmd_statusline(argv[2] if len(argv) > 2 else "")
+    if cmd == "daemon":
+        Daemon().run()
+        return 0
+    if cmd == "popup":
+        return cmd_popup()
+    if cmd == "connect":
+        return cmd_connect(slot_arg(argv))
+    if cmd == "disconnect":
+        return cmd_disconnect(slot_arg(argv))
+    if cmd == "probe":
+        return cmd_probe(slot_arg(argv))
+    if cmd == "run":
+        return cmd_run(slot_arg(argv), argv[3:])
+    if cmd == "refresh":
+        signal_daemon()
+        return 0
+    if cmd == "status":
+        print(json.dumps(build_views(), indent=2, ensure_ascii=False))
+        return 0
+    print(__doc__)
+    return 0 if cmd in ("-h", "--help", "help") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

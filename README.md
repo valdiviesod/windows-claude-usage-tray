@@ -17,6 +17,9 @@ real usage limits of **two independent Claude Pro/Max accounts** without opening
 > itself reports. Consequence: figures appear once the account has been used in Claude Code
 > (or after pressing *Consultar ahora*). If a value is unknown the UI says "No disponible".
 
+> **Linux (Omarchy / Waybar):** a second option lives in [`linux/`](linux/README.md) — a
+> topbar module with a GTK4 panel, same no-credentials approach. Install with `linux/install.sh`.
+
 ## Requirements
 
 - Windows 11 with WebView2 (already included).
