@@ -169,9 +169,17 @@ pub async fn probe(claude: &Path, config_dir: &Path, work_dir: &Path) -> Result<
 
 fn probe_window(v: Option<&Value>) -> Option<LimitWindow> {
     let v = v?;
-    let used = v.get("utilization")?.as_f64()? * PROBE_FRACTION_TO_PCT;
-    let resets = v.get("resetsAt")?.as_i64()?;
+    let used = num(v.get("utilization")?)? * PROBE_FRACTION_TO_PCT;
+    // resetsAt may arrive as int, float or numeric string; ms values are normalized.
+    let mut resets = num(v.get("resetsAt").or_else(|| v.get("resets_at"))?)? as i64;
+    if resets > 100_000_000_000 {
+        resets /= 1000;
+    }
     (used.is_finite() && resets > 0).then(|| LimitWindow { used_pct: used.clamp(0.0, 100.0), resets_at: resets })
+}
+
+fn num(v: &Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str()?.trim().parse().ok())
 }
 
 pub fn parse_probe(stdout: &str, now: i64) -> Option<UsageSnapshot> {
@@ -179,11 +187,20 @@ pub fn parse_probe(stdout: &str, now: i64) -> Option<UsageSnapshot> {
     for line in stdout.lines().filter(|l| l.contains("rate_limit_event")) {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
         let Some(windows) = v.pointer("/rate_limit_info/unifiedWindows") else { continue };
+        let five_hour = probe_window(windows.get("five_hour"));
+        // Top-level resetsAt belongs to the limit named by rateLimitType.
+        let five_hour_resets_at = match five_hour {
+            None if v.pointer("/rate_limit_info/rateLimitType").and_then(Value::as_str) == Some("five_hour") => {
+                v.pointer("/rate_limit_info/resetsAt").and_then(num).map(|t| t as i64).filter(|&t| t > now)
+            }
+            _ => None,
+        };
         let snap = UsageSnapshot {
             captured_at: now,
             source: "probe".into(),
-            five_hour: probe_window(windows.get("five_hour")),
+            five_hour,
             seven_day: probe_window(windows.get("seven_day")),
+            five_hour_resets_at,
         };
         if snap.has_windows() {
             best = Some(snap);

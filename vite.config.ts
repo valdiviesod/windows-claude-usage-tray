@@ -6,5 +6,10 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   clearScreen: false,
   server: { port: 1420, strictPort: true, watch: { ignored: ["**/src-tauri/**"] } },
-  build: { target: "es2022", chunkSizeWarningLimit: 800 },
+  build: {
+    target: "es2022",
+    chunkSizeWarningLimit: 800,
+    // Two webviews: the panel and the tray pill.
+    rollupOptions: { input: { main: "index.html", pill: "pill.html" } },
+  },
 });

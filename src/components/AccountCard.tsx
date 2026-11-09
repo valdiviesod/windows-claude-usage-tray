@@ -1,9 +1,8 @@
-import { AlertTriangle, Ellipsis, LogIn, LogOut, RotateCw, ShieldAlert, Unplug, UserRound } from "lucide-react";
 import { motion } from "motion/react";
 import { useState } from "react";
 import { fmtAgo, fmtClock, fmtPlan, fmtRemaining, pct } from "../lib/format";
 import type { AccountView, LimitWindow } from "../lib/types";
-import { Bar, Button, IconButton } from "./ui";
+import { Bar, Button, Eyebrow, Glyph, IconButton } from "./ui";
 
 interface Props {
   account: AccountView;
@@ -15,69 +14,100 @@ interface Props {
   onProbe: () => void;
 }
 
+const USER = "\uf007";
+const MENU = "···";
+const LOGIN = "\uf090";
+const LOGOUT = "\uf08b";
+const SYNC = "\uf021";
+const WARN = "\uf071";
+const SHIELD = "\uf132";
+const UNPLUG = "\uf127";
+
 const tone = (p: number) => (p >= 100 ? "bad" : p >= 80 ? "warn" : "ok");
+const toneClass = { ok: "text-ok", warn: "text-warn", bad: "text-bad" } as const;
+const toneGlow = {
+  ok: "0 0 24px rgba(169,182,101,0.35)",
+  warn: "0 0 24px rgba(216,166,87,0.4)",
+  bad: "0 0 24px rgba(234,105,98,0.45)",
+} as const;
 
 function Avatar({ email }: { email: string | null }) {
   return (
     <div
-      className={`grid size-9 shrink-0 place-items-center rounded-full font-display text-[15px] font-semibold ${
-        email ? "bg-gradient-to-br from-accent/90 to-accent/50 text-on-accent" : "bg-faint text-mute"
+      className={`grid size-8 shrink-0 place-items-center border text-[13px] font-extrabold ${
+        email ? "border-accent/40 bg-accent/10 text-accent" : "border-line bg-panel text-mute"
       }`}
     >
-      {email ? email.charAt(0).toUpperCase() : <UserRound className="size-[18px]" />}
+      {email ? email.charAt(0).toUpperCase() : <Glyph code={USER} className="text-[12px]" />}
     </div>
   );
 }
 
 function StatusChip({ account }: { account: AccountView }) {
   const map = {
-    available: ["Disponible", "text-ok bg-ok/12"],
-    near_limit: ["Cerca del límite", "text-warn bg-warn/15"],
-    exhausted: ["Agotado", "text-bad bg-bad/12"],
-    no_data: ["Sin datos", "text-mute bg-faint"],
-    disconnected: ["Desconectada", "text-mute bg-faint"],
+    available: ["ok", "disponible"],
+    near_limit: ["warn", "cerca"],
+    exhausted: ["bad", "agotado"],
+    no_data: ["off", "sin datos"],
+    disconnected: ["off", "offline"],
   } as const;
-  const [text, cls] =
+  const [toneKey, text] =
     account.connection === "expired"
-      ? (["Sesión expirada", "text-warn bg-warn/15"] as const)
+      ? (["warn", "expirada"] as const)
       : account.connection === "connecting"
-        ? (["Conectando…", "text-mute bg-faint"] as const)
+        ? (["off", "conectando"] as const)
         : map[account.status];
-  return <span className={`rounded-full px-2 py-px text-[10.5px] font-medium ${cls}`}>{text}</span>;
+  return (
+    <span className={`chip tone-${toneKey}`}>
+      <span className="size-[3px] bg-current" />
+      {text}
+    </span>
+  );
 }
 
 function Window5h({ w, nowMs }: { w: LimitWindow; nowMs: number }) {
   const left = Math.max(0, 100 - w.used_pct);
   const secs = w.resets_at - nowMs / 1000;
+  const t = tone(w.used_pct);
   return (
     <div className="space-y-2">
-      <div className="flex items-end justify-between">
-        <div>
-          <div className="text-[10.5px] font-semibold uppercase tracking-wider text-mute">Ventana de 5 horas</div>
-          <div className="num font-display text-[28px] font-semibold leading-none tracking-tight">{pct(w.used_pct)}</div>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <Eyebrow>ventana 5h</Eyebrow>
+          <div className={`figure num mt-1.5 ${toneClass[t]}`} style={{ textShadow: toneGlow[t] }}>
+            {pct(w.used_pct)}
+            <span className="ml-1 align-baseline text-[9px] font-bold uppercase tracking-[0.16em] text-mute">usado</span>
+          </div>
         </div>
-        <div className="num pb-0.5 text-right text-[12px] text-mute">
-          <div>{pct(left)} restante</div>
-          <div className="text-ink">Reinicia en {fmtRemaining(secs)}</div>
+        <div className="shrink-0 pt-0.5 text-right text-[10px] leading-relaxed">
+          <div className="num text-mute">{pct(left)} libre</div>
+          <div className="num flex items-center justify-end gap-1 text-ink">
+            <Glyph code={SYNC} className="text-[9px] text-accent" />
+            {fmtRemaining(secs)}
+          </div>
         </div>
       </div>
-      <Bar value={w.used_pct} tone={tone(w.used_pct)} />
-      <div className="num text-[11.5px] text-mute">Se reinicia a las {fmtClock(w.resets_at, nowMs)}</div>
+      <Bar value={w.used_pct} tone={t} />
+      <div className="flex items-center justify-between text-[9px] font-bold uppercase tracking-[0.14em] text-mute">
+        <span>reset {fmtClock(w.resets_at, nowMs)}</span>
+        <span className="num text-mute/70">{Math.round(w.used_pct)} / 100</span>
+      </div>
     </div>
   );
 }
 
 function WeeklyRow({ w, nowMs }: { w: LimitWindow; nowMs: number }) {
+  const t = tone(w.used_pct);
   return (
-    <div className="space-y-1.5 border-t border-line pt-2.5">
-      <div className="flex items-center justify-between text-[12px]">
-        <span className="text-mute">Semanal</span>
-        <span className="num">
-          <span className="font-medium">{pct(w.used_pct)}</span>
-          <span className="text-mute"> · reinicia en {fmtRemaining(w.resets_at - nowMs / 1000)}</span>
+    <div className="space-y-1.5 border-t border-line pt-2">
+      <div className="flex items-center justify-between gap-2">
+        <Eyebrow>semanal · 7d</Eyebrow>
+        <span className="num text-[10px]">
+          <span className={`font-bold ${toneClass[t]}`}>{pct(w.used_pct)}</span>
+          <span className="text-mute"> · {fmtRemaining(w.resets_at - nowMs / 1000)}</span>
         </span>
       </div>
-      <Bar value={w.used_pct} tone={tone(w.used_pct)} thin />
+      <Bar value={w.used_pct} tone={t} thin />
     </div>
   );
 }
@@ -87,32 +117,32 @@ function Body({ account, nowMs, busy, onConnect, onProbe, claudeFound }: Props) 
 
   if (connection === "connecting") {
     return (
-      <div className="flex items-center gap-2.5 rounded-xl bg-faint px-3 py-3 text-[12.5px] text-mute">
-        <RotateCw className="size-4 animate-spin" />
-        Completa el inicio de sesión en la ventana que se abrió…
+      <div className="flex items-center gap-2 border border-line bg-faint px-2.5 py-2 text-[10.5px] text-mute">
+        <Glyph code={SYNC} className="animate-spin text-accent" />
+        esperando el login en la ventana de claude…
       </div>
     );
   }
   if (connection === "checking") {
-    return <div className="py-3 text-[12.5px] text-mute">Verificando sesión…</div>;
+    return <div className="py-2 text-[10.5px] text-mute">verificando sesión…</div>;
   }
   if (connection !== "connected") {
     const expired = connection === "expired";
     return (
-      <div className="space-y-3">
+      <div className="space-y-2">
         {(expired || account.error) && (
-          <div className="flex items-start gap-2 rounded-xl bg-warn/12 px-3 py-2 text-[12px] text-warn">
-            <ShieldAlert className="mt-px size-3.5 shrink-0" />
+          <div className="flex items-start gap-1.5 border-l-2 border-warn bg-warn/8 px-2 py-1.5 text-[10.5px] leading-snug text-warn">
+            <Glyph code={SHIELD} className="mt-px text-[10px]" />
             <span>{account.error ?? "La sesión expiró."}</span>
           </div>
         )}
         <Button variant="primary" className="w-full" onClick={onConnect} disabled={!claudeFound}>
-          <LogIn className="size-3.5" />
-          {expired ? "Reconectar Claude" : "Conectar Claude"}
+          <Glyph code={LOGIN} className="text-[10px]" />
+          {expired ? "reconectar claude" : "conectar claude"}
         </Button>
         {!claudeFound && (
-          <p className="text-[11.5px] text-mute">
-            Requiere Claude Code instalado (claude.ai/download). El inicio de sesión lo hace Claude Code, no esta app.
+          <p className="text-[10px] leading-snug text-mute">
+            requiere claude code instalado (claude.ai/download). el login lo hace claude code, no esta app.
           </p>
         )}
       </div>
@@ -122,30 +152,42 @@ function Body({ account, nowMs, busy, onConnect, onProbe, claudeFound }: Props) 
   const five = usage?.five_hour ?? null;
   const week = usage?.seven_day ?? null;
   return (
-    <div className="space-y-3">
+    <div className="space-y-2.5">
       {five ? (
         <Window5h w={five} nowMs={nowMs} />
+      ) : week ? (
+        <div className="flex items-center justify-between border border-dashed border-line bg-faint px-2.5 py-1.5 text-[10px] text-mute">
+          <span className="num font-bold uppercase tracking-[0.18em]">
+            {usage?.five_hour_resets_at
+              ? `:: 5h · activa · reinicia ${fmtRemaining(usage.five_hour_resets_at - nowMs / 1000)}`
+              : ":: 5h · sin ventana activa"}
+          </span>
+          <button onClick={onProbe} disabled={busy} className="text-accent disabled:opacity-50" title="consultar ahora">
+            <Glyph code={SYNC} className={`text-[10px] ${busy ? "animate-spin" : ""}`} />
+          </button>
+        </div>
       ) : (
-        <div className="space-y-2.5 rounded-xl bg-faint px-3 py-3">
-          <div className="flex items-center gap-2 text-[13px] font-medium">
-            <AlertTriangle className="size-3.5 text-mute" />
-            No disponible
+        <div className="space-y-2 border border-dashed border-line bg-faint px-2.5 py-2">
+          <div className="flex items-center gap-1.5 text-[9.5px] font-bold uppercase tracking-[0.18em] text-warn">
+            <Glyph code={WARN} className="text-[10px]" />
+            sin datos
           </div>
-          <p className="text-[12px] leading-snug text-mute">
-            Claude solo informa el uso mientras se usa Claude Code con esta cuenta. Úsalo una vez o consulta ahora (consume una
+          <p className="text-[10px] leading-snug text-mute">
+            claude solo informa el uso mientras usas claude code con esta cuenta. úsalo una vez o consulta ahora (consume una
             petición mínima).
           </p>
           <Button onClick={onProbe} disabled={busy}>
-            <RotateCw className={`size-3.5 ${busy ? "animate-spin" : ""}`} />
-            Consultar ahora
+            <Glyph code={SYNC} className={`text-[10px] ${busy ? "animate-spin" : ""}`} />
+            consultar ahora
           </Button>
         </div>
       )}
       {week && <WeeklyRow w={week} nowMs={nowMs} />}
-      {account.error && <p className="text-[11.5px] text-warn">{account.error}</p>}
+      {account.error && <p className="text-[10px] text-warn">{account.error}</p>}
       {usage && (
-        <p className="num text-[11px] text-mute/80">
-          Dato de {fmtAgo(usage.captured_at, nowMs)} · {usage.source === "probe" ? "consulta directa" : "Claude Code"}
+        <p className="num flex items-center justify-between text-[9px] font-bold uppercase tracking-[0.14em] text-mute/70">
+          <span>src {usage.source === "probe" ? "probe" : "statusline"}</span>
+          <span>{fmtAgo(usage.captured_at, nowMs)}</span>
         </p>
       )}
     </div>
@@ -157,54 +199,76 @@ export function AccountCard(props: Props) {
   const [menu, setMenu] = useState(false);
   const connected = account.connection === "connected";
   const plan = fmtPlan(account.plan);
+  const rail =
+    account.connection !== "connected"
+      ? "bg-line-hi"
+      : account.status === "exhausted"
+        ? "bg-bad"
+        : account.status === "near_limit"
+          ? "bg-warn"
+          : "bg-ok";
 
   return (
     <motion.section
       layout
-      initial={{ opacity: 0, y: 6 }}
+      initial={{ opacity: 0, y: 5 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ type: "spring", stiffness: 380, damping: 32, delay: account.slot * 0.04 }}
-      className="relative rounded-xl bg-card p-3.5 shadow-card"
+      transition={{ type: "spring", stiffness: 420, damping: 34, delay: account.slot * 0.04 }}
+      className="relative border border-line bg-card"
     >
-      <header className="mb-3 flex items-center gap-2.5">
-        <Avatar email={account.email} />
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5">
-            <span className="truncate text-[13.5px] font-semibold">
-              {connected || account.email ? (account.email ?? account.label) : `Cuenta ${account.slot} · ${account.label}`}
-            </span>
+      <span
+        className={`absolute inset-y-0 left-0 w-[2px] ${rail}`}
+        style={{ boxShadow: connected ? "0 0 12px currentColor" : "none" }}
+      />
+      <div className="px-3 py-2.5 pl-3.5">
+        <header className="mb-2.5 flex items-center gap-2">
+          <Avatar email={account.email} />
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-[12px] font-bold tracking-tight">
+              {connected || account.email ? (account.email ?? account.label) : `cuenta ${account.slot} · ${account.label}`}
+            </div>
+            <div className="mt-0.5 flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-[0.16em] text-mute">
+              <span>{account.label}</span>
+              {plan && connected && (
+                <>
+                  <span className="text-line-hi">/</span>
+                  <span>{plan}</span>
+                </>
+              )}
+            </div>
           </div>
-          <div className="flex items-center gap-1.5 text-[11.5px] text-mute">
-            <span>{account.label}</span>
-            {plan && connected && (
-              <>
-                <span>·</span>
-                <span>{plan}</span>
-              </>
-            )}
-          </div>
-        </div>
-        <StatusChip account={account} />
-        {(connected || account.connection === "expired") && (
-          <div className="relative">
-            <IconButton label="Opciones de cuenta" onClick={() => setMenu((v) => !v)} onBlur={() => setTimeout(() => setMenu(false), 120)}>
-              <Ellipsis className="size-4" />
-            </IconButton>
-            {menu && (
-              <div className="absolute right-0 top-8 z-10 w-44 overflow-hidden rounded-lg border border-line bg-panel p-1 shadow-lg backdrop-blur-xl">
-                <button className="flex w-full items-center gap-2 rounded-md px-2.5 py-1 text-left text-[12.5px] hover:bg-accent hover:text-on-accent" onMouseDown={onConnect}>
-                  <RotateCw className="size-3.5" /> Volver a autenticar
-                </button>
-                <button className="flex w-full items-center gap-2 rounded-md px-2.5 py-1 text-left text-[12.5px] text-bad hover:bg-accent hover:text-on-accent" onMouseDown={onDisconnect}>
-                  <LogOut className="size-3.5" /> Desconectar
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-        {account.connection === "error" && <Unplug className="size-4 text-bad" />}
-      </header>
-      <Body {...props} />
+          <StatusChip account={account} />
+          {(connected || account.connection === "expired") && (
+            <div className="relative">
+              <IconButton
+                label="Opciones de cuenta"
+                onClick={() => setMenu((v) => !v)}
+                onBlur={() => setTimeout(() => setMenu(false), 120)}
+              >
+                <Glyph code={MENU} className="text-[12px]" />
+              </IconButton>
+              {menu && (
+                <div className="absolute right-0 top-7 z-30 w-44 border border-line-hi bg-panel p-1 shadow-lg">
+                  <button
+                    className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-[10.5px] uppercase tracking-[0.1em] hover:bg-accent hover:text-on-accent"
+                    onMouseDown={onConnect}
+                  >
+                    <Glyph code={SYNC} className="text-[10px]" /> re-autenticar
+                  </button>
+                  <button
+                    className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-[10.5px] uppercase tracking-[0.1em] text-bad hover:bg-bad hover:text-on-accent"
+                    onMouseDown={onDisconnect}
+                  >
+                    <Glyph code={LOGOUT} className="text-[10px]" /> desconectar
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+          {account.connection === "error" && <Glyph code={UNPLUG} className="text-[11px] text-bad" />}
+        </header>
+        <Body {...props} />
+      </div>
     </motion.section>
   );
 }

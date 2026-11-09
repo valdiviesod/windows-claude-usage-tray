@@ -9,6 +9,8 @@ export const api = {
   disconnect: (slot: number) => invoke<void>("disconnect_account", { slot }),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
   fitWindow: (height: number) => invoke<void>("fit_window", { height }),
+  fitPill: (width: number, height: number) => invoke<void>("fit_pill", { width, height }),
+  toggleWindow: () => invoke<void>("toggle_window"),
   hide: () => invoke<void>("hide_window"),
   quit: () => invoke<void>("quit_app"),
 };

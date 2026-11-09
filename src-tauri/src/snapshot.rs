@@ -30,6 +30,7 @@ pub fn parse_statusline(input: &str, now: i64) -> Option<UsageSnapshot> {
         source: "statusline".into(),
         five_hour: parse_window(limits.get("five_hour")),
         seven_day: parse_window(limits.get("seven_day")),
+        ..Default::default()
     };
     snap.has_windows().then_some(snap)
 }

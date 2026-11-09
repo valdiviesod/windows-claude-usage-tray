@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage-tray"
-version = "0.2.1"
+version = "0.3.0"
 description = "Claude Usage — System Tray monitor for two Claude accounts"
 edition = "2021"
 rust-version = "1.77"
@@ -29,5 +29,8 @@ tempfile = "3"
 opt-level = "s"
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
+
+[target."cfg(windows)".dependencies]
+uiautomation = { version = "0.16", default-features = false }

@@ -5,6 +5,14 @@ real usage limits of **two independent Claude Pro/Max accounts** without opening
 
 - One tray icon. Left click toggles the floating window; right click: *Actualizar*,
   *Configuración*, *Salir*. Tooltip summarises both accounts.
+- A small text pill docked **inside the taskbar**, just left of the notification area
+  (chevron / keyboard language / clock), shows the limits without opening anything
+  (`5H 16% · WEEK 24%`, or `P 16%/24% · T 5%/8%` with both accounts connected) in JetBrains
+  Mono. Click it to open the panel; the pill hides while the panel is open and comes back
+  when it closes. Windows tray icons are 16 px wide, so text needs its own borderless
+  always-on-top window; it re-raises itself only when a taskbar click puts the bar above it,
+  and falls back to the bottom-right corner if the taskbar is vertical or auto-hidden.
+  Details: [docs/TRAY-PILL.md](docs/TRAY-PILL.md).
 - Background sync runs in Rust (works with the window hidden), 60 s by default, with
   cache, manual refresh, exponential backoff and single-flight syncs.
 - Window hides on blur; closing it never stops the process. Single instance. Starts with
@@ -20,6 +28,12 @@ real usage limits of **two independent Claude Pro/Max accounts** without opening
 > **Linux (Omarchy / Waybar):** a second option lives in [`linux/`](linux/README.md) — a
 > topbar module with a GTK4 panel, same no-credentials approach. Install with `linux/install.sh`.
 
+## Look & feel
+
+The UI follows the same Omarchy (gruvbox) palette as the Linux port — `#1d2021` panels,
+`#d4be98` ink, teal `#7daea3` accent, segmented meters — and sets **JetBrainsMono Nerd
+Font** for all text (falls back to JetBrains Mono / system monospace when not installed).
+
 ## Requirements
 
 - Windows 11 with WebView2 (already included).
@@ -28,13 +42,14 @@ real usage limits of **two independent Claude Pro/Max accounts** without opening
 
 ## Install
 
-Run `src-tauri\target\release\bundle\nsis\Claude Usage_0.2.1_x64-setup.exe` (per-user, no admin)
+Run `src-tauri\target\release\bundle\nsis\Claude Usage_0.3.0_x64-setup.exe` (per-user, no admin)
 or the `.msi` next to it. The app starts hidden in the tray area (click `^` to find it and
-drag it onto the taskbar if you want it always visible).
+drag it onto the taskbar if you want it always visible) and the usage pill docks in the taskbar
+on its own, left of the clock and the notification icons.
 
 ## Use
 
-1. Click the tray icon. Each card says **Conectar Claude**.
+1. Click the tray icon (or the usage pill in the taskbar). Each card says **Conectar Claude**.
 2. Press it for account 1: a console opens running the official `claude auth login`; the
    browser opens Claude's own sign-in. Pick the account you want as *Personal*. Repeat for
    account 2 (*Trabajo*) with the other account (use a private window or switch account on
@@ -77,9 +92,12 @@ src-tauri/src
   sync.rs       background engine: per-account state machine, backoff, alerts, tray tooltip
   cache.rs      last-known data across restarts (never shown as live)
   alerts.rs     80/95/100 % thresholds (once per window), backoff and time formatting
-  window.rs     placement above the tray icon (any taskbar edge/monitor), toggle, hide-on-blur
+  window.rs     panel placement above the tray icon (any taskbar edge/monitor), toggle,
+                hide-on-blur; taskbar-docked usage pill: placement, z-order guard, show/hide
   tray.rs       single tray icon + menu
 src/            React UI: no polling, state pushed by Rust events; timers only while visible
+  pill.tsx      second webview entry (pill.html), same engine events as the panel
+  components/UsagePill.tsx  tray pill text, tones and self-sizing (see docs/TRAY-PILL.md)
 ```
 
 Security: no secrets stored by the app; `ANTHROPIC_API_KEY` & co. are scrubbed from every
@@ -88,11 +106,12 @@ child process so they cannot override a profile; the statusline helper refuses t
 
 ## Tests
 
-`cargo test --lib` (41 tests): account isolation (paths, snapshots, statusline helper),
+`cargo test --lib` (45 tests): account isolation (paths, snapshots, statusline helper),
 parsing and corrupt data, status thresholds, expired windows, auth state machine
 (login / logout / expiry / identity change / restart), error backoff, notifications once per
 window, cache restart roundtrip, window placement (bottom/top/left/right taskbar, multi
-monitor, negative origins) and the tray-click-after-blur guard.
+monitor, negative origins), pill placement (taskbar docking, corner fallback, clamping) and the
+tray-click-after-blur guard.
 
 Connected accounts appear first, followed by accounts without an active session.
 Within each group, the original slot order is preserved.

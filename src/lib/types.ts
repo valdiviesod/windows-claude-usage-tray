@@ -11,6 +11,7 @@ export interface UsageSnapshot {
   source: "statusline" | "probe" | string;
   five_hour: LimitWindow | null;
   seven_day: LimitWindow | null;
+  five_hour_resets_at?: number | null;
 }
 
 export interface AccountView {

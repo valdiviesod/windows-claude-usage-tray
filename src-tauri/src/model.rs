@@ -49,6 +49,10 @@ pub struct UsageSnapshot {
     pub source: String,
     pub five_hour: Option<LimitWindow>,
     pub seven_day: Option<LimitWindow>,
+    /// Reset of an active 5h window whose utilization Claude did not report
+    /// (the probe event only carries it for the binding limit).
+    #[serde(default)]
+    pub five_hour_resets_at: Option<i64>,
 }
 
 impl UsageSnapshot {
@@ -60,6 +64,7 @@ impl UsageSnapshot {
             source: self.source.clone(),
             five_hour: self.five_hour.filter(|w| w.resets_at > now),
             seven_day: self.seven_day.filter(|w| w.resets_at > now),
+            five_hour_resets_at: self.five_hour_resets_at.filter(|&t| t > now),
         }
     }
 
@@ -97,7 +102,12 @@ pub fn compute_status(conn: Connection, usage: Option<&UsageSnapshot>, now: i64)
     if conn != Connection::Connected {
         return UsageStatus::Disconnected;
     }
-    let live = usage.and_then(|u| u.five_hour).filter(|w| w.resets_at > now);
+    // Worst live window decides: with no active 5h window Claude only reports
+    // the weekly one, which is still real data.
+    let live = usage.map(|u| u.live(now)).and_then(|u| match (u.five_hour, u.seven_day) {
+        (Some(a), Some(b)) => Some(if b.used_pct > a.used_pct { b } else { a }),
+        (a, b) => a.or(b),
+    });
     match live {
         None => UsageStatus::NoData,
         Some(w) if w.used_pct >= 100.0 => UsageStatus::Exhausted,
@@ -145,6 +155,7 @@ mod tests {
             source: "statusline".into(),
             five_hour: Some(LimitWindow { used_pct: pct, resets_at }),
             seven_day: None,
+            five_hour_resets_at: None,
         }
     }
 

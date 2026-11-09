@@ -65,6 +65,16 @@ fn fit_window(app: AppHandle, height: f64) {
 }
 
 #[tauri::command]
+fn fit_pill(app: AppHandle, width: f64, height: f64) {
+    window::fit_pill(&app, width, height);
+}
+
+#[tauri::command]
+fn toggle_window(app: AppHandle) {
+    window::toggle(&app);
+}
+
+#[tauri::command]
 fn hide_window(app: AppHandle) {
     window::hide(&app);
 }
@@ -110,6 +120,15 @@ pub fn statusline(slot_arg: &str) -> i32 {
 }
 
 pub fn run() {
+    // Release builds have no console: keep every panic in crash.log.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let path = paths::base_dir().join("crash.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let bt = std::backtrace::Backtrace::force_capture();
+            let _ = writeln!(f, "[{:?}] {info}\n{bt}\n", std::time::SystemTime::now());
+        }
+    }));
     tauri::Builder::default()
         // Must be first: a second launch just focuses the running instance.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| window::show(app)))
@@ -124,6 +143,8 @@ pub fn run() {
             disconnect_account,
             save_settings,
             fit_window,
+            fit_pill,
+            toggle_window,
             hide_window,
             quit_app
         ])
@@ -153,6 +174,10 @@ pub fn run() {
             let engine = Engine::new(paths::base_dir(), exe, settings);
             app.manage(engine.clone());
             tray::build(&handle, engine.clone())?;
+            // Always start in the tray: WebView2 creation can surface the
+            // window even with `visible: false` in the config.
+            window::hide(&handle);
+            window::build_pill(&handle)?;
             tauri::async_runtime::spawn(engine.run(handle));
             Ok(())
         })
